@@ -16,19 +16,33 @@
 
 ## 安装说明
 
-1. 克隆仓库：
+1. 创建工作空间：
+```bash
+# 在Windows PowerShell中执行
+mkdir D:\code\python\ERAGV\src
+cd D:\code\python\ERAGV\src
+```
+
+2. 克隆仓库：
 ```bash
 git clone https://github.com/qruueiwwwe/ERAGV.git
 ```
 
-2. 安装依赖：
+3. 安装依赖：
 ```bash
 pip install -r requirements.txt
 ```
 
-3. 编译ROS包：
+4. 编译ROS包：
 ```bash
+cd D:\code\python\ERAGV
 catkin_make
+```
+
+5. 设置环境变量：
+```bash
+# 在Windows PowerShell中执行
+.\devel\setup.ps1
 ```
 
 ## 使用方法
@@ -54,9 +68,29 @@ angular:
 
 配置文件位于 `config/elephant_agv_config.yaml`，包含以下主要参数：
 
-- serial_port: AGV串口设备名
+- serial_port: AGV串口设备名（Windows下通常为 COM3 等）
 - baud_rate: 串口波特率
 - timeout: 通信超时时间
+
+## 目录结构
+
+```
+D:\code\python\ERAGV\
+├── src\
+│   └── elephant_agv_driver\
+│       ├── CMakeLists.txt
+│       ├── package.xml
+│       ├── requirements.txt
+│       ├── config\
+│       │   └── elephant_agv_config.yaml
+│       ├── launch\
+│       │   └── elephant_agv.launch
+│       └── scripts\
+│           └── elephant_agv_node.py
+├── build\
+├── devel\
+└── README.md
+```
 
 ## 许可证
 
