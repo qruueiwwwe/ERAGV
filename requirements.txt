@@ -1,0 +1,4 @@
+pyserial>=3.5
+numpy>=1.21.0
+pyyaml>=6.0
+rospy>=1.15.0 

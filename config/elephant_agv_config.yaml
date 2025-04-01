@@ -1,0 +1,14 @@
+serial_port: /dev/ttyUSB0
+baud_rate: 115200
+timeout: 1.0
+
+# AGV参数配置
+max_linear_velocity: 1.0  # m/s
+max_angular_velocity: 1.0  # rad/s
+min_linear_velocity: 0.1  # m/s
+min_angular_velocity: 0.1  # rad/s
+
+# 控制参数
+acceleration: 0.5  # m/s^2
+deceleration: 0.5  # m/s^2
+angular_acceleration: 0.5  # rad/s^2 
