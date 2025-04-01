@@ -6,7 +6,7 @@
     <!-- 启动AGV驱动节点 -->
     <node name="elephant_agv_node" pkg="elephant_agv_driver" type="elephant_agv_node.py" output="screen">
         <!-- 可以通过launch参数覆盖配置文件中的参数 -->
-        <param name="serial_port" value="/dev/ttyUSB0" unless="$(eval arg('serial_port') == '')"/>
+        <param name="serial_port" value="COM3" unless="$(eval arg('serial_port') == '')"/>
         <param name="baud_rate" value="115200" unless="$(eval arg('baud_rate') == '')"/>
     </node>
 </launch> 

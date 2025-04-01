@@ -1,4 +1,4 @@
-serial_port: /dev/ttyUSB0
+serial_port: COM3
 baud_rate: 115200
 timeout: 1.0
 
