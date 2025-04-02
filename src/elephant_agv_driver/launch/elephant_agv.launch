@@ -8,5 +8,16 @@
         <!-- 可以通过launch参数覆盖配置文件中的参数 -->
         <param name="serial_port" value="COM3" unless="$(eval arg('serial_port') == '')"/>
         <param name="baud_rate" value="115200" unless="$(eval arg('baud_rate') == '')"/>
+        
+        <!-- 麦克纳姆轮参数 -->
+        <param name="wheel_diameter" value="0.1" unless="$(eval arg('wheel_diameter') == '')"/>
+        <param name="wheel_separation_x" value="0.5" unless="$(eval arg('wheel_separation_x') == '')"/>
+        <param name="wheel_separation_y" value="0.5" unless="$(eval arg('wheel_separation_y') == '')"/>
+        
+        <!-- 运动限制参数 -->
+        <param name="max_linear_velocity" value="1.0" unless="$(eval arg('max_linear_velocity') == '')"/>
+        <param name="max_angular_velocity" value="1.0" unless="$(eval arg('max_angular_velocity') == '')"/>
+        <param name="max_diagonal_velocity" value="0.7" unless="$(eval arg('max_diagonal_velocity') == '')"/>
+        <param name="max_arc_velocity" value="0.6" unless="$(eval arg('max_arc_velocity') == '')"/>
     </node>
 </launch> 

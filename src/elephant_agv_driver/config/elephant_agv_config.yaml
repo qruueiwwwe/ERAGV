@@ -8,7 +8,16 @@ max_angular_velocity: 1.0  # rad/s
 min_linear_velocity: 0.1  # m/s
 min_angular_velocity: 0.1  # rad/s
 
+# 麦克纳姆轮参数
+wheel_diameter: 0.1  # m
+wheel_separation_x: 0.5  # m
+wheel_separation_y: 0.5  # m
+
 # 控制参数
 acceleration: 0.5  # m/s^2
 deceleration: 0.5  # m/s^2
-angular_acceleration: 0.5  # rad/s^2 
+angular_acceleration: 0.5  # rad/s^2
+
+# 运动限制
+max_diagonal_velocity: 0.7  # m/s
+max_arc_velocity: 0.6  # m/s 
