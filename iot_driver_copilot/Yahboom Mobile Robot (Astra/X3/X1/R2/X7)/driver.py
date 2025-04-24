@@ -1,254 +1,180 @@
 import os
 import threading
 import json
-import io
-import time
-
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import socketserver
-
 import cv2
-from cv_bridge import CvBridge
 import numpy as np
-
 import rospy
+from flask import Flask, Response, request, jsonify
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Empty
-from std_msgs.msg import Float32MultiArray
+from cv_bridge import CvBridge
 
-# --- ENVIRONMENT CONFIGURATION ---
-ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', 'http://localhost:11311')
-ROS_HOSTNAME = os.environ.get('ROS_HOSTNAME', 'localhost')
-ROS_NAMESPACE = os.environ.get('ROS_NAMESPACE', '')
-ROBOT_IP = os.environ.get('ROBOT_IP', 'localhost')
+# Environment configuration
+DEVICE_ROS_MASTER_URI = os.environ.get("DEVICE_ROS_MASTER_URI", "http://localhost:11311")
+DEVICE_ROS_IP = os.environ.get("DEVICE_ROS_IP", "127.0.0.1")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RGB_IMAGE_TOPIC = os.environ.get("RGB_IMAGE_TOPIC", "/camera/rgb/image_raw")
+DEPTH_IMAGE_TOPIC = os.environ.get("DEPTH_IMAGE_TOPIC", "/camera/depth/image_raw")
+CMD_VEL_TOPIC = os.environ.get("CMD_VEL_TOPIC", "/cmd_vel")
+STOP_SERVICE = os.environ.get("STOP_SERVICE", "/emergency_stop")
+PARAM_SERVICE = os.environ.get("PARAM_SERVICE", "/set_param")
+MODE_TOPIC = os.environ.get("MODE_TOPIC", "/robot_mode")
+MAP_ACTION_TOPIC = os.environ.get("MAP_ACTION_TOPIC", "/map_action")
 
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8000))
+os.environ["ROS_MASTER_URI"] = DEVICE_ROS_MASTER_URI
+os.environ["ROS_IP"] = DEVICE_ROS_IP
 
-RGB_TOPIC = os.environ.get('RGB_TOPIC', '/camera/rgb/image_raw')
-DEPTH_TOPIC = os.environ.get('DEPTH_TOPIC', '/camera/depth/image_raw')
-SPEED_TOPIC = os.environ.get('SPEED_TOPIC', '/cmd_vel')
-STOP_SERVICE = os.environ.get('STOP_SERVICE', '/emergency_stop')
-PARAM_TOPIC = os.environ.get('PARAM_TOPIC', '/tuning_param')
-MAP_ACTION_TOPIC = os.environ.get('MAP_ACTION_TOPIC', '/map_action')
-MODE_TOPIC = os.environ.get('MODE_TOPIC', '/set_mode')
+app = Flask(__name__)
+bridge = CvBridge()
 
-# --- ROS INITIALIZATION ---
-os.environ['ROS_MASTER_URI'] = ROS_MASTER_URI
-os.environ['ROS_HOSTNAME'] = ROS_HOSTNAME
+# ROS Node initialization
+def ros_spin():
+    if not rospy.core.is_initialized():
+        rospy.init_node('yahboom_http_driver', anonymous=True, disable_signals=True)
+threading.Thread(target=ros_spin, daemon=True).start()
 
-rospy.init_node('yahboom_http_driver', anonymous=True, disable_signals=True)
-
-cv_bridge = CvBridge()
-
-# Shared image frames
-latest_rgb_frame = {"img": None, "stamp": 0}
-latest_depth_frame = {"img": None, "stamp": 0}
-rgb_lock = threading.Lock()
-depth_lock = threading.Lock()
-
+# Global frame buffers
+rgb_frame = {"img": None, "lock": threading.Lock()}
+depth_frame = {"img": None, "lock": threading.Lock()}
 
 def rgb_callback(msg):
-    global latest_rgb_frame
-    img = cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-    with rgb_lock:
-        latest_rgb_frame['img'] = img
-        latest_rgb_frame['stamp'] = time.time()
-
+    with rgb_frame["lock"]:
+        rgb_frame["img"] = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
 def depth_callback(msg):
-    global latest_depth_frame
-    img = cv_bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-    norm_img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-    norm_img = np.uint8(norm_img)
-    depth_colored = cv2.applyColorMap(norm_img, cv2.COLORMAP_JET)
-    with depth_lock:
-        latest_depth_frame['img'] = depth_colored
-        latest_depth_frame['stamp'] = time.time()
+    with depth_frame["lock"]:
+        img = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        # Normalize for visualization (optional)
+        norm_img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+        depth_frame["img"] = np.uint8(norm_img)
 
+def ensure_ros_subscribers():
+    if not hasattr(ensure_ros_subscribers, "inited"):
+        rospy.Subscriber(RGB_IMAGE_TOPIC, Image, rgb_callback, queue_size=1)
+        rospy.Subscriber(DEPTH_IMAGE_TOPIC, Image, depth_callback, queue_size=1)
+        ensure_ros_subscribers.inited = True
+ensure_ros_subscribers()
 
-# ROS Subscribers
-rospy.Subscriber(RGB_TOPIC, Image, rgb_callback, queue_size=1)
-rospy.Subscriber(DEPTH_TOPIC, Image, depth_callback, queue_size=1)
-
-# Publishers
-speed_pub = rospy.Publisher(SPEED_TOPIC, Twist, queue_size=1)
-param_pub = rospy.Publisher(PARAM_TOPIC, Float32MultiArray, queue_size=1)
-map_action_pub = rospy.Publisher(MAP_ACTION_TOPIC, String, queue_size=1)
-mode_pub = rospy.Publisher(MODE_TOPIC, String, queue_size=1)
-
-# Service Proxy for Stop
-try:
-    rospy.wait_for_service(STOP_SERVICE, timeout=5)
-    stop_srv = rospy.ServiceProxy(STOP_SERVICE, Empty)
-except Exception:
-    stop_srv = None
-
-
-# --- HTTP SERVER HANDLER ---
-class YahboomHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, content_type='application/json', code=200):
-        self.send_response(code)
-        self.send_header('Content-type', content_type)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-
-    def do_OPTIONS(self):
-        self.send_response(200, "ok")
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
-
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/rgb':
-            self._serve_mjpeg('rgb')
-        elif parsed_path.path == '/depth':
-            self._serve_mjpeg('depth')
+def gen_rgb_stream():
+    while True:
+        with rgb_frame["lock"]:
+            img = rgb_frame["img"].copy() if rgb_frame["img"] is not None else None
+        if img is not None:
+            ret, jpeg = cv2.imencode('.jpg', img)
+            if ret:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
         else:
-            self._set_headers('application/json', 404)
-            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
+            # Black frame as placeholder
+            blank = np.zeros((240, 320, 3), np.uint8)
+            ret, jpeg = cv2.imencode('.jpg', blank)
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+        rospy.sleep(0.05)
 
-    def _serve_mjpeg(self, img_type):
-        self.send_response(200)
-        self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
-        self.send_header('Cache-Control', 'no-cache')
-        self.end_headers()
-        try:
-            while True:
-                if img_type == 'rgb':
-                    with rgb_lock:
-                        img = latest_rgb_frame['img'].copy() if latest_rgb_frame['img'] is not None else None
-                else:
-                    with depth_lock:
-                        img = latest_depth_frame['img'].copy() if latest_depth_frame['img'] is not None else None
-
-                if img is not None:
-                    _, jpg = cv2.imencode('.jpg', img)
-                    self.wfile.write(b"--frame\r\n")
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
-                    self.wfile.write(jpg.tobytes())
-                    self.wfile.write(b"\r\n")
-                else:
-                    blank = np.zeros((480, 640, 3), dtype=np.uint8)
-                    _, jpg = cv2.imencode('.jpg', blank)
-                    self.wfile.write(b"--frame\r\n")
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
-                    self.wfile.write(jpg.tobytes())
-                    self.wfile.write(b"\r\n")
-                time.sleep(0.1)
-        except BrokenPipeError:
-            pass
-        except Exception:
-            pass
-
-    def do_POST(self):
-        parsed_path = urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length) if content_length > 0 else b'{}'
-        try:
-            data = json.loads(body.decode('utf-8'))
-        except Exception:
-            data = {}
-
-        if parsed_path.path == '/param':
-            self._handle_param(data)
-        elif parsed_path.path == '/stop':
-            self._handle_stop()
-        elif parsed_path.path == '/map':
-            self._handle_map(data)
-        elif parsed_path.path == '/speed':
-            self._handle_speed(data)
-        elif parsed_path.path == '/mode':
-            self._handle_mode(data)
+def gen_depth_stream():
+    while True:
+        with depth_frame["lock"]:
+            img = depth_frame["img"].copy() if depth_frame["img"] is not None else None
+        if img is not None:
+            colored = cv2.applyColorMap(img, cv2.COLORMAP_JET)
+            ret, jpeg = cv2.imencode('.jpg', colored)
+            if ret:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
         else:
-            self._set_headers('application/json', 404)
-            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
+            blank = np.zeros((240, 320, 3), np.uint8)
+            ret, jpeg = cv2.imencode('.jpg', blank)
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+        rospy.sleep(0.05)
 
-    def _handle_param(self, data):
-        arr = Float32MultiArray()
-        arr.data = []
-        for v in data.values():
-            try:
-                arr.data.append(float(v))
-            except Exception:
-                pass
-        param_pub.publish(arr)
-        self._set_headers('application/json', 200)
-        self.wfile.write(json.dumps({'status': 'ok'}).encode())
+@app.route('/rgb')
+def rgb_stream():
+    return Response(gen_rgb_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    def _handle_stop(self):
-        if stop_srv:
-            try:
-                stop_srv()
-                self._set_headers('application/json', 200)
-                self.wfile.write(json.dumps({'status': 'stopped'}).encode())
-            except Exception as e:
-                self._set_headers('application/json', 500)
-                self.wfile.write(json.dumps({'error': str(e)}).encode())
-        else:
-            self._set_headers('application/json', 500)
-            self.wfile.write(json.dumps({'error': 'Stop service unavailable'}).encode())
+@app.route('/depth')
+def depth_stream():
+    return Response(gen_depth_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    def _handle_map(self, data):
-        try:
-            action = data.get('action', 'save')
-            options = data.get('options', {})
-            msg = {'action': action, 'options': options}
-            map_action_pub.publish(String(json.dumps(msg)))
-            self._set_headers('application/json', 200)
-            self.wfile.write(json.dumps({'status': 'map_action_sent'}).encode())
-        except Exception as e:
-            self._set_headers('application/json', 500)
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
-
-    def _handle_speed(self, data):
-        try:
-            linear = data.get('linear', 0.0)
-            angular = data.get('angular', 0.0)
-            tw = Twist()
-            tw.linear.x = float(linear)
-            tw.angular.z = float(angular)
-            speed_pub.publish(tw)
-            self._set_headers('application/json', 200)
-            self.wfile.write(json.dumps({'status': 'speed_commanded'}).encode())
-        except Exception as e:
-            self._set_headers('application/json', 500)
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
-
-    def _handle_mode(self, data):
-        try:
-            mode = data.get('mode', '')
-            if mode:
-                mode_pub.publish(String(mode))
-                self._set_headers('application/json', 200)
-                self.wfile.write(json.dumps({'status': 'mode_switched'}).encode())
-            else:
-                self._set_headers('application/json', 400)
-                self.wfile.write(json.dumps({'error': 'Missing mode'}).encode())
-        except Exception as e:
-            self._set_headers('application/json', 500)
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
-
-
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-def run_server():
-    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), YahboomHandler)
-    print(f"Yahboom HTTP driver running on {SERVER_HOST}:{SERVER_PORT}")
+@app.route('/speed', methods=['POST'])
+def set_speed():
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down HTTP driver...")
-        server.server_close()
+        data = request.get_json(force=True)
+        twist = Twist()
+        twist.linear.x = float(data.get('linear', 0.0))
+        twist.angular.z = float(data.get('angular', 0.0))
+        pub = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=1)
+        pub.publish(twist)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "fail", "error": str(e)}), 400
 
+@app.route('/stop', methods=['POST'])
+def stop_robot():
+    try:
+        rospy.wait_for_service(STOP_SERVICE, timeout=2)
+        stop_srv = rospy.ServiceProxy(STOP_SERVICE, Empty)
+        stop_srv()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        # Fallback: publish zero velocity if no stop service
+        try:
+            pub = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=1)
+            twist = Twist()
+            pub.publish(twist)
+        except Exception:
+            pass
+        return jsonify({"status": "fail", "error": str(e)}), 400
+
+@app.route('/param', methods=['POST'])
+def set_param():
+    try:
+        data = request.get_json(force=True)
+        rospy.wait_for_service(PARAM_SERVICE, timeout=2)
+        set_param_srv = rospy.ServiceProxy(PARAM_SERVICE, String)
+        resp = set_param_srv(String(json.dumps(data)))
+        return jsonify({"status": "ok", "response": resp.data}), 200
+    except Exception as e:
+        return jsonify({"status": "fail", "error": str(e)}), 400
+
+@app.route('/mode', methods=['POST'])
+def set_mode():
+    try:
+        data = request.get_json(force=True)
+        mode = data.get('mode', '')
+        pub = rospy.Publisher(MODE_TOPIC, String, queue_size=1)
+        pub.publish(String(mode))
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "fail", "error": str(e)}), 400
+
+@app.route('/map', methods=['POST'])
+def map_action():
+    try:
+        data = request.get_json(force=True)
+        pub = rospy.Publisher(MAP_ACTION_TOPIC, String, queue_size=1)
+        pub.publish(String(json.dumps(data)))
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "fail", "error": str(e)}), 400
+
+@app.route('/')
+def root_info():
+    return jsonify({
+        "endpoints": [
+            {"method": "GET", "path": "/rgb", "description": "RGB camera stream (HTTP MJPEG)"},
+            {"method": "GET", "path": "/depth", "description": "Depth image stream (HTTP MJPEG)"},
+            {"method": "POST", "path": "/speed", "description": "Set robot speed"},
+            {"method": "POST", "path": "/stop", "description": "Emergency stop"},
+            {"method": "POST", "path": "/param", "description": "Set HSV/PID or other parameters"},
+            {"method": "POST", "path": "/mode", "description": "Switch robot mode"},
+            {"method": "POST", "path": "/map", "description": "Perform map actions"}
+        ]
+    })
 
 if __name__ == '__main__':
-    run_server()
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
