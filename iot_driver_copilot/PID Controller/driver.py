@@ -3,113 +3,112 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
-# In-memory "device" state
-DEVICE_STATE = {
-    "mode": "PID",
-    "Kp": 1.0,
-    "Ti": 1.0,
-    "Td": 0.0,
-    "system_stability": 0.0,
-    "error_signal": 0.0,
-    "output_signal": 0.0
+# Get configuration from environment variables
+DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
+DEVICE_PORT = int(os.environ.get('DEVICE_PORT', '9000'))  # Port for device protocol, if needed
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
+
+# Simulated device state
+device_state = {
+    'mode': 'PID',  # Default mode
+    'pid': {
+        'Kp': 1.0,
+        'Ti': 1.0,
+        'Td': 0.0
+    }
 }
 
-# Allowed modes
-VALID_MODES = {"P", "PI", "PD", "PID"}
+VALID_MODES = ['P', 'PI', 'PD', 'PID']
 
-def get_env(name, default=None, opt_type=str):
-    val = os.environ.get(name)
-    if val is None:
-        if default is not None:
-            return default
-        else:
-            raise RuntimeError(f"Missing environment variable: {name}")
-    try:
-        return opt_type(val)
-    except Exception:
-        raise RuntimeError(f"Invalid value for environment variable {name}: {val}")
-
-class PIDControllerHandler(BaseHTTPRequestHandler):
-    def _set_response(self, status=200, content_type="application/json"):
-        self.send_response(status)
-        self.send_header("Content-type", content_type)
+class PIDControllerHTTPRequestHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, code=200, content_type='application/json'):
+        self.send_response(code)
+        self.send_header('Content-type', content_type)
         self.end_headers()
 
-    def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
+    def _handle_mode_post(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
         try:
             payload = json.loads(body)
-        except Exception:
-            self._set_response(400)
-            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
-            return
-
-        if self.path == "/mode":
-            mode = payload.get("mode")
+            mode = payload.get('mode')
             if not mode or mode not in VALID_MODES:
-                self._set_response(400)
-                self.wfile.write(json.dumps({"error": f"Invalid mode. Must be one of {sorted(VALID_MODES)}"}).encode())
+                self._set_headers(400)
+                self.wfile.write(json.dumps({'error': f'Invalid mode. Valid modes: {VALID_MODES}'}).encode())
                 return
-            DEVICE_STATE["mode"] = mode
-            self._set_response(200)
-            self.wfile.write(json.dumps({"result": "Mode updated", "mode": mode}).encode())
-            return
+            device_state['mode'] = mode
+            self._set_headers(200)
+            self.wfile.write(json.dumps({'status': 'success', 'mode': mode}).encode())
+        except Exception as e:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({'error': 'Invalid JSON or payload', 'detail': str(e)}).encode())
 
-        elif self.path == "/pid":
-            kp = payload.get("Kp")
-            ti = payload.get("Ti")
-            td = payload.get("Td")
-            errors = []
-            if kp is not None:
-                try:
-                    DEVICE_STATE["Kp"] = float(kp)
-                except Exception:
-                    errors.append("Kp must be a number")
-            if ti is not None:
-                try:
-                    DEVICE_STATE["Ti"] = float(ti)
-                except Exception:
-                    errors.append("Ti must be a number")
-            if td is not None:
-                try:
-                    DEVICE_STATE["Td"] = float(td)
-                except Exception:
-                    errors.append("Td must be a number")
-            if errors:
-                self._set_response(400)
-                self.wfile.write(json.dumps({"error": errors}).encode())
+    def _handle_pid_post(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        try:
+            payload = json.loads(body)
+            kp = payload.get('Kp')
+            ti = payload.get('Ti')
+            td = payload.get('Td')
+            if kp is None or ti is None or td is None:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({'error': 'Kp, Ti, and Td must be specified'}).encode())
                 return
-            self._set_response(200)
-            self.wfile.write(json.dumps({
-                "result": "PID parameters updated",
-                "Kp": DEVICE_STATE["Kp"],
-                "Ti": DEVICE_STATE["Ti"],
-                "Td": DEVICE_STATE["Td"]
-            }).encode())
-            return
+            device_state['pid']['Kp'] = float(kp)
+            device_state['pid']['Ti'] = float(ti)
+            device_state['pid']['Td'] = float(td)
+            self._set_headers(200)
+            self.wfile.write(json.dumps({'status': 'success', 'pid': device_state['pid']}).encode())
+        except Exception as e:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({'error': 'Invalid JSON or payload', 'detail': str(e)}).encode())
 
+    def _handle_get_status(self):
+        self._set_headers(200)
+        status = {
+            'mode': device_state['mode'],
+            'pid': device_state['pid']
+        }
+        self.wfile.write(json.dumps({'status': 'ok', 'device': status}).encode())
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/mode':
+            self._handle_mode_post()
+        elif parsed_path.path == '/pid':
+            self._handle_pid_post()
         else:
-            self._set_response(404)
-            self.wfile.write(json.dumps({"error": "Not Found"}).encode())
+            self._set_headers(404)
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/state":
-            self._set_response(200)
-            self.wfile.write(json.dumps(DEVICE_STATE).encode())
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/':
+            self._set_headers(200, 'text/html')
+            html = """
+            <html>
+                <head><title>PID Controller HTTP Driver</title></head>
+                <body>
+                <h2>PID Controller Driver</h2>
+                <p>POST /mode with {"mode": "P/PI/PD/PID"} to set mode.<br>
+                   POST /pid with {"Kp": float, "Ti": float, "Td": float} to set PID params.<br>
+                   GET /status for current state.</p>
+                </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
+        elif parsed_path.path == '/status':
+            self._handle_get_status()
         else:
-            self._set_response(404)
-            self.wfile.write(json.dumps({"error": "Not Found"}).encode())
+            self._set_headers(404)
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
 
-def main():
-    server_host = get_env("HTTP_SERVER_HOST", "0.0.0.0")
-    server_port = get_env("HTTP_SERVER_PORT", 8080, int)
-    httpd = HTTPServer((server_host, server_port), PIDControllerHandler)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    httpd.server_close()
+def run(server_class=HTTPServer, handler_class=PIDControllerHTTPRequestHandler):
+    httpd = server_class((HTTP_SERVER_HOST, HTTP_SERVER_PORT), handler_class)
+    print(f"PID Controller HTTP Driver running at http://{HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}/")
+    httpd.serve_forever()
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    run()
