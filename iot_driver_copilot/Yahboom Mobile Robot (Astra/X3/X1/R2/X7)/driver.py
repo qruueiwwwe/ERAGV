@@ -1,242 +1,182 @@
 import os
-import json
-import asyncio
 import threading
-from functools import partial
-from typing import Optional
+import json
+import time
+import io
 
-from fastapi import FastAPI, Request, Response, BackgroundTasks, status
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
-
-import rclpy
-from rclpy.node import Node
-
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist
+from flask import Flask, request, Response, jsonify, stream_with_context
+import rospy
 from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry, OccupancyGrid
 from std_srvs.srv import Empty
-from std_msgs.msg import Float32MultiArray
+from dynamic_reconfigure.msg import Config
+from dynamic_reconfigure.srv import Reconfigure, ReconfigureRequest
 
-# --- Environment Configuration ---
-DEVICE_IP = os.environ.get('DEVICE_IP', 'localhost')
-ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', f'http://{DEVICE_IP}:11311')
-ROS_DOMAIN_ID = os.environ.get('ROS_DOMAIN_ID', '0')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8000'))
-IMAGE_TOPIC = os.environ.get('IMAGE_TOPIC', '/camera/color/image_raw')
-DEPTH_TOPIC = os.environ.get('DEPTH_TOPIC', '/camera/depth/image_raw')
-CMD_VEL_TOPIC = os.environ.get('CMD_VEL_TOPIC', '/cmd_vel')
-STOP_TOPIC = os.environ.get('STOP_TOPIC', '/stop_signal')
-PARAM_TOPIC = os.environ.get('PARAM_TOPIC', '/param_tune')
-MODE_TOPIC = os.environ.get('MODE_TOPIC', '/mode_switch')
-MAP_SERVICE = os.environ.get('MAP_SERVICE', '/map_service')
-MAP_TOPIC = os.environ.get('MAP_TOPIC', '/map_cmd')
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
 
-# --- FastAPI App ---
-app = FastAPI(
-    title="Yahboom Mobile Robot HTTP ROS Driver",
-    description="HTTP API for Yahboom Mobile Robot (Astra/X3/X1/R2/X7) with ROS backend.",
-    version="1.0.0"
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+# --- Environment variables ---
+ROS_MASTER_URI = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+ROS_HOSTNAME = os.environ.get("ROS_HOSTNAME", "localhost")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RGB_TOPIC = os.environ.get("RGB_TOPIC", "/camera/rgb/image_raw")
+DEPTH_TOPIC = os.environ.get("DEPTH_TOPIC", "/camera/depth/image_raw")
+CMD_VEL_TOPIC = os.environ.get("CMD_VEL_TOPIC", "/cmd_vel")
+STOP_TOPIC = os.environ.get("STOP_TOPIC", "/stop")
+MODE_TOPIC = os.environ.get("MODE_TOPIC", "/mode")
+PARAM_SERVICE = os.environ.get("PARAM_SERVICE", "/set_parameters")
+MAP_SERVICE = os.environ.get("MAP_SERVICE", "/map_manager")
+BRIDGE = CvBridge()
 
-# --- ROS2 Node Management ---
+app = Flask(__name__)
 
-class ROSNode(Node):
-    def __init__(self):
-        super().__init__("yahboom_http_bridge")
-        self.image_msg: Optional[Image] = None
-        self.depth_msg: Optional[Image] = None
-        self._lock = threading.Lock()
-        self.image_sub = self.create_subscription(
-            Image, IMAGE_TOPIC, self.image_callback, 10)
-        self.depth_sub = self.create_subscription(
-            Image, DEPTH_TOPIC, self.depth_callback, 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
-        self.stop_pub = self.create_publisher(String, STOP_TOPIC, 10)
-        self.param_pub = self.create_publisher(Float32MultiArray, PARAM_TOPIC, 10)
-        self.mode_pub = self.create_publisher(String, MODE_TOPIC, 10)
-        # For map management: use topic or service, depending on implementation
-        self.map_pub = self.create_publisher(String, MAP_TOPIC, 10)
-        self.map_cli = self.create_client(Empty, MAP_SERVICE)
+# --- ROS Node Initialization ---
+def init_ros():
+    if not rospy.core.is_initialized():
+        rospy.init_node("yahboom_http_driver", anonymous=True, disable_signals=True)
 
-    def image_callback(self, msg):
-        with self._lock:
-            self.image_msg = msg
+init_ros()
 
-    def depth_callback(self, msg):
-        with self._lock:
-            self.depth_msg = msg
+# Publishers
+cmd_vel_pub = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=10)
+stop_pub = rospy.Publisher(STOP_TOPIC, String, queue_size=10)
+mode_pub = rospy.Publisher(MODE_TOPIC, String, queue_size=10)
 
-    def get_image(self, kind='rgb'):
-        with self._lock:
-            if kind == 'rgb':
-                return self.image_msg
-            elif kind == 'depth':
-                return self.depth_msg
-            else:
-                return None
+# --- Video Stream Buffers ---
+latest_rgb = {"msg": None, "stamp": 0}
+latest_depth = {"msg": None, "stamp": 0}
 
-# --- ROS2 Initialization and Threading ---
+def rgb_callback(msg):
+    latest_rgb["msg"] = msg
+    latest_rgb["stamp"] = time.time()
 
-rclpy.init(args=None)
-ros_node = ROSNode()
-ros_thread = threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True)
-ros_thread.start()
+def depth_callback(msg):
+    latest_depth["msg"] = msg
+    latest_depth["stamp"] = time.time()
 
-# --- Models ---
+rgb_sub = rospy.Subscriber(RGB_TOPIC, Image, rgb_callback, queue_size=1)
+depth_sub = rospy.Subscriber(DEPTH_TOPIC, Image, depth_callback, queue_size=1)
 
-class SpeedCommand(BaseModel):
-    linear: float
-    angular: float
+# --- MJPEG Streaming Generators ---
+def mjpeg_stream_generator(image_source, img_type="rgb"):
+    while True:
+        img_msg = image_source["msg"]
+        if img_msg is not None:
+            try:
+                cv_img = BRIDGE.imgmsg_to_cv2(img_msg, desired_encoding="bgr8" if img_type == "rgb" else "passthrough")
+                if img_type == "depth":
+                    # Normalize and convert depth image to 8-bit for display
+                    cv_img = np.nan_to_num(cv_img)
+                    cv_img = (cv_img / np.max(cv_img) * 255).astype(np.uint8)
+                ret, jpeg = cv2.imencode('.jpg', cv_img)
+                if ret:
+                    frame = jpeg.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            except Exception:
+                pass
+        time.sleep(0.05)
 
-class ParamTuning(BaseModel):
-    params: dict
+@app.route('/stream/rgb')
+def stream_rgb():
+    return Response(stream_with_context(mjpeg_stream_generator(latest_rgb, "rgb")),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-class ModeSwitch(BaseModel):
-    mode: str
-
-class MapAction(BaseModel):
-    action: str
-    options: Optional[dict] = None
+@app.route('/stream/depth')
+def stream_depth():
+    return Response(stream_with_context(mjpeg_stream_generator(latest_depth, "depth")),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # --- API Endpoints ---
 
-@app.post("/param")
-async def param_tuning(request: Request):
-    data = await request.json()
-    params = data.get("params", {})
-    if not isinstance(params, dict):
-        return JSONResponse({"error": "params must be a dict."}, status_code=400)
-    arr = Float32MultiArray()
-    arr.data = []
-    for v in params.values():
-        try:
-            arr.data.append(float(v))
-        except:
-            arr.data.append(0.0)
-    ros_node.param_pub.publish(arr)
-    return JSONResponse({"status": "ok", "sent_params": params})
-
-@app.post("/stop")
-async def stop_robot():
-    ros_node.stop_pub.publish(String(data="emergency_stop"))
-    return JSONResponse({"status": "stopped"})
-
-@app.post("/map")
-async def map_action(action: MapAction, background_tasks: BackgroundTasks):
-    if action.action.lower() == "save":
-        def call_service():
-            while not ros_node.map_cli.wait_for_service(timeout_sec=1.0):
-                pass
-            req = Empty.Request()
-            future = ros_node.map_cli.call_async(req)
-            rclpy.spin_until_future_complete(ros_node, future)
-        background_tasks.add_task(call_service)
-        return JSONResponse({"status": "map_save_requested"})
-    elif action.action.lower() == "nav":
-        nav_cmd = String()
-        nav_cmd.data = json.dumps(action.options) if action.options else "{}"
-        ros_node.map_pub.publish(nav_cmd)
-        return JSONResponse({"status": "map_nav_command_sent"})
-    else:
-        return JSONResponse({"error": "Invalid action. Use 'save' or 'nav'."}, status_code=400)
-
-@app.post("/speed")
-async def set_speed(cmd: SpeedCommand):
-    twist = Twist()
-    twist.linear.x = float(cmd.linear)
-    twist.angular.z = float(cmd.angular)
-    ros_node.cmd_vel_pub.publish(twist)
-    return JSONResponse({"status": "speed_set", "linear": cmd.linear, "angular": cmd.angular})
-
-@app.post("/mode")
-async def set_mode(mode: ModeSwitch):
-    ros_node.mode_pub.publish(String(data=mode.mode))
-    return JSONResponse({"status": "mode_set", "mode": mode.mode})
-
-# --- MJPEG Streaming (RGB/DEPTH) ---
-
-def image_to_jpeg_bytes(msg: Image) -> Optional[bytes]:
+@app.route("/param", methods=["POST"])
+def set_param():
+    data = request.get_json(force=True)
     try:
-        # For sensor_msgs/Image in RGB8 or MONO8, the data is raw. For browser streaming, we need JPEG.
-        # We'll use OpenCV for conversion, but to avoid 3rd party command execution, do it in-Python.
-        import numpy as np
-        import cv2
-        if msg.encoding.lower() in ["rgb8", "bgr8"]:
-            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
-            if msg.encoding.lower() == "rgb8":
-                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            _, jpeg = cv2.imencode('.jpg', arr)
-            return jpeg.tobytes()
-        elif msg.encoding.lower() in ["mono8"]:
-            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width))
-            _, jpeg = cv2.imencode('.jpg', arr)
-            return jpeg.tobytes()
-        elif msg.encoding.lower() in ["16uc1", "mono16"]:
-            arr = np.frombuffer(msg.data, dtype=np.uint16).reshape((msg.height, msg.width))
-            # Normalize and convert to 8-bit for JPEG
-            arr8 = np.clip(arr / (arr.max() / 255.0 + 1e-5), 0, 255).astype(np.uint8)
-            _, jpeg = cv2.imencode('.jpg', arr8)
-            return jpeg.tobytes()
+        rospy.wait_for_service(PARAM_SERVICE, timeout=2)
+        param_srv = rospy.ServiceProxy(PARAM_SERVICE, Reconfigure)
+        req = ReconfigureRequest()
+        for k, v in data.items():
+            req.config.doubles.append(Config.DoubleParameter(name=k, value=float(v)))
+        resp = param_srv(req)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    try:
+        # Option 1: publish to a stop topic
+        stop_pub.publish(String(data="stop"))
+        # Option 2: send zero velocity
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        cmd_vel_pub.publish(twist)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route("/map", methods=["POST"])
+def map_manage():
+    data = request.get_json(force=True)
+    action = data.get("action", "")
+    options = data.get("options", {})
+    try:
+        rospy.wait_for_service(MAP_SERVICE, timeout=2)
+        map_srv = rospy.ServiceProxy(MAP_SERVICE, Empty)
+        if action in ["save", "nav"]:
+            map_srv()
+            return jsonify({"status": "ok", "action": action}), 200
         else:
-            return None
-    except Exception:
-        return None
+            return jsonify({"status": "error", "error": "Invalid action"}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
-async def mjpeg_stream(kind='rgb'):
-    boundary = "frame"
-    while True:
-        msg = ros_node.get_image(kind=kind)
-        if msg is not None:
-            jpeg = image_to_jpeg_bytes(msg)
-            if jpeg is not None:
-                yield (
-                    b"--%s\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: %d\r\n\r\n" % (boundary.encode(), len(jpeg))
-                )
-                yield jpeg
-                yield b"\r\n"
-        await asyncio.sleep(0.07)  # ~14fps
+@app.route("/speed", methods=["POST"])
+def set_speed():
+    data = request.get_json(force=True)
+    linear = float(data.get("linear", 0))
+    angular = float(data.get("angular", 0))
+    twist = Twist()
+    twist.linear.x = linear
+    twist.angular.z = angular
+    try:
+        cmd_vel_pub.publish(twist)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
-@app.get("/stream/rgb")
-async def rgb_stream():
-    return StreamingResponse(
-        mjpeg_stream('rgb'),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+@app.route("/mode", methods=["POST"])
+def set_mode():
+    data = request.get_json(force=True)
+    mode = data.get("mode", "")
+    try:
+        mode_pub.publish(String(data=mode))
+        return jsonify({"status": "ok", "mode": mode}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
-@app.get("/stream/depth")
-async def depth_stream():
-    return StreamingResponse(
-        mjpeg_stream('depth'),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-@app.get("/")
+# --- Root/Info Page ---
+@app.route("/")
 def root():
-    return PlainTextResponse(
-        "Yahboom Mobile Robot HTTP ROS Driver\n\n"
-        "API Endpoints:\n"
-        "POST /param - System parameter tuning\n"
-        "POST /stop - Emergency stop\n"
-        "POST /map - Map save/nav\n"
-        "POST /speed - Set speed\n"
-        "POST /mode - Mode switch\n"
-        "GET /stream/rgb - MJPEG RGB stream\n"
-        "GET /stream/depth - MJPEG Depth stream"
-    )
-
-# --- Main Server Entry Point ---
+    return jsonify({
+        "device": "Yahboom Mobile Robot",
+        "manufacturer": "Yahboom, Orbbec",
+        "api": [
+            {"method": "POST", "path": "/param", "desc": "Adjust system parameters"},
+            {"method": "POST", "path": "/stop", "desc": "Emergency stop"},
+            {"method": "POST", "path": "/map", "desc": "Map management (save/nav)"},
+            {"method": "POST", "path": "/speed", "desc": "Set robot speed"},
+            {"method": "POST", "path": "/mode", "desc": "Set robot mode"},
+            {"method": "GET", "path": "/stream/rgb", "desc": "RGB camera MJPEG stream"},
+            {"method": "GET", "path": "/stream/depth", "desc": "Depth camera MJPEG stream"}
+        ]
+    })
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
