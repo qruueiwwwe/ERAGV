@@ -1,180 +1,209 @@
 import os
+import io
 import threading
 import json
+import time
 import cv2
 import numpy as np
-import rospy
 from flask import Flask, Response, request, jsonify
+import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 from std_srvs.srv import Empty
 from cv_bridge import CvBridge
 
-# Environment configuration
-DEVICE_ROS_MASTER_URI = os.environ.get("DEVICE_ROS_MASTER_URI", "http://localhost:11311")
-DEVICE_ROS_IP = os.environ.get("DEVICE_ROS_IP", "127.0.0.1")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-RGB_IMAGE_TOPIC = os.environ.get("RGB_IMAGE_TOPIC", "/camera/rgb/image_raw")
-DEPTH_IMAGE_TOPIC = os.environ.get("DEPTH_IMAGE_TOPIC", "/camera/depth/image_raw")
-CMD_VEL_TOPIC = os.environ.get("CMD_VEL_TOPIC", "/cmd_vel")
-STOP_SERVICE = os.environ.get("STOP_SERVICE", "/emergency_stop")
-PARAM_SERVICE = os.environ.get("PARAM_SERVICE", "/set_param")
-MODE_TOPIC = os.environ.get("MODE_TOPIC", "/robot_mode")
-MAP_ACTION_TOPIC = os.environ.get("MAP_ACTION_TOPIC", "/map_action")
-
-os.environ["ROS_MASTER_URI"] = DEVICE_ROS_MASTER_URI
-os.environ["ROS_IP"] = DEVICE_ROS_IP
+# --- ENVIRONMENT VARIABLES ---
+ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', 'http://localhost:11311')
+ROS_IP = os.environ.get('ROS_IP', '127.0.0.1')
+ROS_NAMESPACE = os.environ.get('ROS_NAMESPACE', '')
+HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
+HTTP_PORT = int(os.environ.get('HTTP_PORT', '8080'))
+CAMERA_RGB_TOPIC = os.environ.get('CAMERA_RGB_TOPIC', '/camera/color/image_raw')
+CAMERA_DEPTH_TOPIC = os.environ.get('CAMERA_DEPTH_TOPIC', '/camera/depth/image_raw')
+SPEED_TOPIC = os.environ.get('SPEED_TOPIC', '/cmd_vel')
+MODE_TOPIC = os.environ.get('MODE_TOPIC', '/mode')
+STOP_TOPIC = os.environ.get('STOP_TOPIC', '/stop')
+PARAM_TOPIC = os.environ.get('PARAM_TOPIC', '/param')
+MAP_ACTION_TOPIC = os.environ.get('MAP_ACTION_TOPIC', '/map_action')
+MAP_SERVICE_SAVE = os.environ.get('MAP_SERVICE_SAVE', '/save_map')
+MAP_SERVICE_NAV = os.environ.get('MAP_SERVICE_NAV', '/start_nav')
+# ---
 
 app = Flask(__name__)
 bridge = CvBridge()
 
-# ROS Node initialization
-def ros_spin():
-    if not rospy.core.is_initialized():
-        rospy.init_node('yahboom_http_driver', anonymous=True, disable_signals=True)
-threading.Thread(target=ros_spin, daemon=True).start()
+# --- ROS Node Startup ---
+def start_ros_node():
+    try:
+        rospy.get_master().getPid()
+    except:
+        rospy.init_node("yahboom_http_driver", anonymous=True, disable_signals=True)
 
-# Global frame buffers
-rgb_frame = {"img": None, "lock": threading.Lock()}
-depth_frame = {"img": None, "lock": threading.Lock()}
+ros_thread = threading.Thread(target=start_ros_node)
+ros_thread.daemon = True
+ros_thread.start()
+time.sleep(1)
+
+# --- IMAGE STREAMING ---
+latest_rgb_image = {"data": None, "time": 0}
+latest_depth_image = {"data": None, "time": 0}
 
 def rgb_callback(msg):
-    with rgb_frame["lock"]:
-        rgb_frame["img"] = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+    latest_rgb_image["data"] = msg
+    latest_rgb_image["time"] = time.time()
 
 def depth_callback(msg):
-    with depth_frame["lock"]:
-        img = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        # Normalize for visualization (optional)
-        norm_img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-        depth_frame["img"] = np.uint8(norm_img)
+    latest_depth_image["data"] = msg
+    latest_depth_image["time"] = time.time()
 
-def ensure_ros_subscribers():
-    if not hasattr(ensure_ros_subscribers, "inited"):
-        rospy.Subscriber(RGB_IMAGE_TOPIC, Image, rgb_callback, queue_size=1)
-        rospy.Subscriber(DEPTH_IMAGE_TOPIC, Image, depth_callback, queue_size=1)
-        ensure_ros_subscribers.inited = True
-ensure_ros_subscribers()
+rospy.Subscriber(CAMERA_RGB_TOPIC, Image, rgb_callback)
+rospy.Subscriber(CAMERA_DEPTH_TOPIC, Image, depth_callback)
 
-def gen_rgb_stream():
+def gen_mjpeg(image_type='rgb'):
     while True:
-        with rgb_frame["lock"]:
-            img = rgb_frame["img"].copy() if rgb_frame["img"] is not None else None
-        if img is not None:
-            ret, jpeg = cv2.imencode('.jpg', img)
-            if ret:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+        if image_type == 'rgb':
+            img_msg = latest_rgb_image["data"]
+        elif image_type == 'depth':
+            img_msg = latest_depth_image["data"]
         else:
-            # Black frame as placeholder
-            blank = np.zeros((240, 320, 3), np.uint8)
-            ret, jpeg = cv2.imencode('.jpg', blank)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        rospy.sleep(0.05)
-
-def gen_depth_stream():
-    while True:
-        with depth_frame["lock"]:
-            img = depth_frame["img"].copy() if depth_frame["img"] is not None else None
-        if img is not None:
-            colored = cv2.applyColorMap(img, cv2.COLORMAP_JET)
-            ret, jpeg = cv2.imencode('.jpg', colored)
-            if ret:
+            img_msg = None
+        if img_msg is not None:
+            try:
+                cv_img = bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8' if image_type=='rgb' else 'passthrough')
+                if image_type == 'depth':
+                    # Normalize depth for visualization
+                    norm_img = cv2.normalize(cv_img, None, 0, 255, cv2.NORM_MINMAX)
+                    norm_img = np.uint8(norm_img)
+                    norm_img = cv2.applyColorMap(norm_img, cv2.COLORMAP_JET)
+                    cv_img = norm_img
+                ret, jpeg = cv2.imencode('.jpg', cv_img)
+                if not ret:
+                    continue
+                frame = jpeg.tobytes()
                 yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        else:
-            blank = np.zeros((240, 320, 3), np.uint8)
-            ret, jpeg = cv2.imencode('.jpg', blank)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        rospy.sleep(0.05)
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            except Exception:
+                continue
+        time.sleep(0.05)
 
-@app.route('/rgb')
-def rgb_stream():
-    return Response(gen_rgb_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route("/stream/rgb")
+def stream_rgb():
+    return Response(gen_mjpeg('rgb'), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route('/depth')
-def depth_stream():
-    return Response(gen_depth_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route("/stream/depth")
+def stream_depth():
+    return Response(gen_mjpeg('depth'), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route('/speed', methods=['POST'])
+# --- CONTROL ENDPOINTS ---
+
+@app.route("/speed", methods=["POST"])
 def set_speed():
     try:
         data = request.get_json(force=True)
+        linear = float(data.get('linear', 0.0))
+        angular = float(data.get('angular', 0.0))
+        pub = rospy.Publisher(SPEED_TOPIC, Twist, queue_size=1)
         twist = Twist()
-        twist.linear.x = float(data.get('linear', 0.0))
-        twist.angular.z = float(data.get('angular', 0.0))
-        pub = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=1)
+        twist.linear.x = linear
+        twist.angular.z = angular
         pub.publish(twist)
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok", "msg": "Speed command sent"})
     except Exception as e:
-        return jsonify({"status": "fail", "error": str(e)}), 400
+        return jsonify({"status": "error", "msg": str(e)}), 400
 
-@app.route('/stop', methods=['POST'])
-def stop_robot():
-    try:
-        rospy.wait_for_service(STOP_SERVICE, timeout=2)
-        stop_srv = rospy.ServiceProxy(STOP_SERVICE, Empty)
-        stop_srv()
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        # Fallback: publish zero velocity if no stop service
-        try:
-            pub = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=1)
-            twist = Twist()
-            pub.publish(twist)
-        except Exception:
-            pass
-        return jsonify({"status": "fail", "error": str(e)}), 400
-
-@app.route('/param', methods=['POST'])
-def set_param():
-    try:
-        data = request.get_json(force=True)
-        rospy.wait_for_service(PARAM_SERVICE, timeout=2)
-        set_param_srv = rospy.ServiceProxy(PARAM_SERVICE, String)
-        resp = set_param_srv(String(json.dumps(data)))
-        return jsonify({"status": "ok", "response": resp.data}), 200
-    except Exception as e:
-        return jsonify({"status": "fail", "error": str(e)}), 400
-
-@app.route('/mode', methods=['POST'])
+@app.route("/mode", methods=["POST"])
 def set_mode():
     try:
         data = request.get_json(force=True)
-        mode = data.get('mode', '')
+        mode = data.get('mode')
+        if not mode:
+            return jsonify({"status": "error", "msg": "No mode provided"}), 400
         pub = rospy.Publisher(MODE_TOPIC, String, queue_size=1)
-        pub.publish(String(mode))
-        return jsonify({"status": "ok"}), 200
+        msg = String()
+        msg.data = str(mode)
+        pub.publish(msg)
+        return jsonify({"status": "ok", "msg": f"Mode set to {mode}"})
     except Exception as e:
-        return jsonify({"status": "fail", "error": str(e)}), 400
+        return jsonify({"status": "error", "msg": str(e)}), 400
 
-@app.route('/map', methods=['POST'])
+@app.route("/stop", methods=["POST"])
+def stop_robot():
+    try:
+        pub = rospy.Publisher(STOP_TOPIC, String, queue_size=1)
+        msg = String()
+        msg.data = "stop"
+        pub.publish(msg)
+        return jsonify({"status": "ok", "msg": "Stop command sent"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)}), 400
+
+@app.route("/param", methods=["POST"])
+def set_param():
+    try:
+        data = request.get_json(force=True)
+        pub = rospy.Publisher(PARAM_TOPIC, String, queue_size=1)
+        msg = String()
+        msg.data = json.dumps(data)
+        pub.publish(msg)
+        return jsonify({"status": "ok", "msg": "Parameter update sent"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)}), 400
+
+@app.route("/map", methods=["POST"])
 def map_action():
     try:
         data = request.get_json(force=True)
-        pub = rospy.Publisher(MAP_ACTION_TOPIC, String, queue_size=1)
-        pub.publish(String(json.dumps(data)))
-        return jsonify({"status": "ok"}), 200
+        action = data.get('action')
+        if not action:
+            return jsonify({"status": "error", "msg": "No action provided"}), 400
+        if action == 'save':
+            rospy.wait_for_service(MAP_SERVICE_SAVE, timeout=3)
+            map_save = rospy.ServiceProxy(MAP_SERVICE_SAVE, Empty)
+            map_save()
+            return jsonify({"status": "ok", "msg": "Map save triggered"})
+        elif action == 'nav':
+            rospy.wait_for_service(MAP_SERVICE_NAV, timeout=3)
+            map_nav = rospy.ServiceProxy(MAP_SERVICE_NAV, Empty)
+            map_nav()
+            return jsonify({"status": "ok", "msg": "Navigation started"})
+        else:
+            pub = rospy.Publisher(MAP_ACTION_TOPIC, String, queue_size=1)
+            msg = String()
+            msg.data = json.dumps(data)
+            pub.publish(msg)
+            return jsonify({"status": "ok", "msg": f"Custom map action {action} sent"})
     except Exception as e:
-        return jsonify({"status": "fail", "error": str(e)}), 400
+        return jsonify({"status": "error", "msg": str(e)}), 400
 
-@app.route('/')
-def root_info():
-    return jsonify({
-        "endpoints": [
-            {"method": "GET", "path": "/rgb", "description": "RGB camera stream (HTTP MJPEG)"},
-            {"method": "GET", "path": "/depth", "description": "Depth image stream (HTTP MJPEG)"},
-            {"method": "POST", "path": "/speed", "description": "Set robot speed"},
-            {"method": "POST", "path": "/stop", "description": "Emergency stop"},
-            {"method": "POST", "path": "/param", "description": "Set HSV/PID or other parameters"},
-            {"method": "POST", "path": "/mode", "description": "Switch robot mode"},
-            {"method": "POST", "path": "/map", "description": "Perform map actions"}
-        ]
-    })
+# --- ROOT PAGE FOR BROWSER ---
+@app.route("/")
+def index():
+    return """
+    <html>
+      <head>
+        <title>Yahboom Robot HTTP Driver</title>
+      </head>
+      <body>
+        <h1>Yahboom Mobile Robot HTTP Driver</h1>
+        <h2>Live Streams</h2>
+        <div>
+          <b>RGB Camera:</b><br>
+          <img src="/stream/rgb" width="480"/><br>
+          <b>Depth Camera:</b><br>
+          <img src="/stream/depth" width="480"/>
+        </div>
+        <h2>API Endpoints</h2>
+        <ul>
+          <li>POST /param - Adjust system parameters (JSON: HSV/PID)</li>
+          <li>POST /stop - Issue emergency stop</li>
+          <li>POST /map - Map actions (JSON: {"action": "save"|"nav"|custom})</li>
+          <li>POST /speed - Set speed (JSON: {"linear": 1.0, "angular": 0.5})</li>
+          <li>POST /mode - Set mode (JSON: {"mode": "manual"/"autonomous"/...})</li>
+        </ul>
+      </body>
+    </html>
+    """
 
-if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+if __name__ == "__main__":
+    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
