@@ -1,109 +1,93 @@
 import os
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import threading
-import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib import request, parse, error
 
-# Configuration from Environment Variables
-DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
-DEVICE_HTTP_PORT = int(os.environ.get('DEVICE_HTTP_PORT', '80'))
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+DEVICE_IP = os.environ.get("DEVICE_IP")
+DEVICE_HTTP_PORT = int(os.environ.get("DEVICE_HTTP_PORT", 80))
 
-# Helper Functions for Device Communication via HTTP/REST API
-def device_get_data():
-    url = f'http://{DEVICE_HOST}:{DEVICE_HTTP_PORT}/api/data'
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", 8080))
+
+DEVICE_BASE_URL = f"http://{DEVICE_IP}:{DEVICE_HTTP_PORT}"
+
+def get_device_data():
     try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        return resp.json(), 200
+        with request.urlopen(f"{DEVICE_BASE_URL}/api/v1/data", timeout=5) as resp:
+            return resp.status, resp.read(), dict(resp.getheaders())
+    except error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers)
     except Exception as e:
-        return {"error": f"Device unreachable: {str(e)}"}, 502
+        return 502, json.dumps({"error": f"Device unreachable: {str(e)}"}).encode(), {}
 
-def device_post_ota():
-    url = f'http://{DEVICE_HOST}:{DEVICE_HTTP_PORT}/api/ota'
+def post_device_ota():
     try:
-        resp = requests.post(url, timeout=10)
-        resp.raise_for_status()
-        return resp.json() if resp.content else {"status": "OTA triggered"}, 200
+        req = request.Request(f"{DEVICE_BASE_URL}/api/v1/ota", method="POST")
+        with request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read(), dict(resp.getheaders())
+    except error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers)
     except Exception as e:
-        return {"error": f"OTA failed: {str(e)}"}, 502
+        return 502, json.dumps({"error": f"Device unreachable: {str(e)}"}).encode(), {}
 
-def device_post_thresh(payload):
-    url = f'http://{DEVICE_HOST}:{DEVICE_HTTP_PORT}/api/thresh'
+def post_device_thresholds(payload):
     try:
-        resp = requests.post(url, json=payload, timeout=5)
-        resp.raise_for_status()
-        return resp.json() if resp.content else {"status": "Thresholds updated"}, 200
+        data = json.dumps(payload).encode()
+        req = request.Request(f"{DEVICE_BASE_URL}/api/v1/thresh", data=data, headers={'Content-Type': 'application/json'}, method="POST")
+        with request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read(), dict(resp.getheaders())
+    except error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers)
     except Exception as e:
-        return {"error": f"Threshold update failed: {str(e)}"}, 502
+        return 502, json.dumps({"error": f"Device unreachable: {str(e)}"}).encode(), {}
 
-# HTTP Handler
-class SmartTempHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, code=200, content_type="application/json"):
-        self.send_response(code)
-        self.send_header('Content-type', content_type)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+class SmartTempH100Driver(BaseHTTPRequestHandler):
+    def _set_headers(self, status=200, headers=None):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        if headers:
+            for k, v in headers.items():
+                if k.lower() == "content-type":
+                    continue
+                self.send_header(k, v)
         self.end_headers()
-        
-    def _parse_json(self):
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length == 0:
-                return None
-            return json.loads(self.rfile.read(content_length).decode('utf-8'))
-        except Exception:
-            return None
 
-    def do_OPTIONS(self):
-        self._set_headers(200)
-    
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/data":
-            data, code = device_get_data()
-            self._set_headers(code)
-            self.wfile.write(json.dumps(data).encode('utf-8'))
+        if self.path == "/data":
+            status, body, headers = get_device_data()
+            self._set_headers(status, headers)
+            self.wfile.write(body)
         else:
             self._set_headers(404)
-            self.wfile.write(json.dumps({"error": "Not found"}).encode('utf-8'))
+            self.wfile.write(json.dumps({"error": "Not found"}).encode())
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/ota":
-            data, code = device_post_ota()
-            self._set_headers(code)
-            self.wfile.write(json.dumps(data).encode('utf-8'))
-        elif parsed.path == "/thresh":
-            payload = self._parse_json()
-            if not payload or not isinstance(payload, dict):
+        if self.path == "/ota":
+            status, body, headers = post_device_ota()
+            self._set_headers(status, headers)
+            self.wfile.write(body)
+        elif self.path == "/thresh":
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b''
+            try:
+                payload = json.loads(body)
+                status, resp_body, headers = post_device_thresholds(payload)
+                self._set_headers(status, headers)
+                self.wfile.write(resp_body)
+            except json.JSONDecodeError:
                 self._set_headers(400)
-                self.wfile.write(json.dumps({"error": "Invalid JSON payload"}).encode('utf-8'))
-                return
-            data, code = device_post_thresh(payload)
-            self._set_headers(code)
-            self.wfile.write(json.dumps(data).encode('utf-8'))
+                self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
         else:
             self._set_headers(404)
-            self.wfile.write(json.dumps({"error": "Not found"}).encode('utf-8'))
+            self.wfile.write(json.dumps({"error": "Not found"}).encode())
 
-# Threaded HTTP Server
-class ThreadedHTTPServer(HTTPServer, threading.Thread):
-    def run(self):
-        self.serve_forever()
-
-def main():
+def run():
     server_address = (SERVER_HOST, SERVER_PORT)
-    httpd = HTTPServer(server_address, SmartTempHandler)
-    print(f"SmartTemp-H100 HTTP Driver running at http://{SERVER_HOST}:{SERVER_PORT}/")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    httpd.server_close()
+    httpd = HTTPServer(server_address, SmartTempH100Driver)
+    print(f"SmartTemp-H100 Driver HTTP server running at http://{SERVER_HOST}:{SERVER_PORT}")
+    httpd.serve_forever()
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    if not DEVICE_IP:
+        raise RuntimeError("DEVICE_IP environment variable must be set.")
+    run()
